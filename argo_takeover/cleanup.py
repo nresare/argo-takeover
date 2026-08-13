@@ -261,6 +261,16 @@ def value_changes(
     return tuple(changes)
 
 
+def cleanup_refs(
+    refs: list[ResourceRef], kubectl: Kubectl, *, apply: bool
+) -> list[CleanupResult]:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = pool.map(
+            lambda ref: cleanup_resource(ref, kubectl, apply=apply), refs
+        )
+    return list(results)
+
+
 def cleanup_release(
     namespace: str,
     release: str,
@@ -271,11 +281,24 @@ def cleanup_release(
     """Clean every object owned by ``release``; a dry run unless ``apply``."""
     release_data = load_release(namespace, release, kubectl)
     refs = parse_manifest(release_data.get("manifest") or "", namespace)
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = pool.map(
-            lambda ref: cleanup_resource(ref, kubectl, apply=apply), refs
-        )
-    return list(results)
+    return cleanup_refs(refs, kubectl, apply=apply)
+
+
+def cleanup_manifest(
+    namespace: str,
+    manifest: str,
+    kubectl: Kubectl = run_kubectl,
+    *,
+    apply: bool = False,
+) -> list[CleanupResult]:
+    """Clean every object in a rendered manifest, e.g. ``helm template`` output.
+
+    For when the release secret is already gone: only the object references
+    are taken from the manifest, so a re-render does not need to reproduce the
+    installed values exactly — it just has to name the same objects.
+    """
+    refs = parse_manifest(manifest, namespace)
+    return cleanup_refs(refs, kubectl, apply=apply)
 
 
 def delete_release_secrets(
