@@ -196,6 +196,18 @@ def parse_manifest(manifest: str, default_namespace: str) -> list[ResourceRef]:
     return refs
 
 
+def tracking_exempt(ref: ResourceRef) -> bool:
+    """Whether Argo CD tracks this object without annotating it.
+
+    Argo CD deliberately skips the tracking annotation on the
+    CustomResourceDefinitions it applies, so its absence says nothing about
+    whether the takeover happened: https://github.com/argoproj/argo-cd/issues/17400
+    """
+    return ref.kind == "CustomResourceDefinition" and ref.api_version.startswith(
+        "apiextensions.k8s.io/"
+    )
+
+
 def check_resource(ref: ResourceRef, kubectl: Kubectl) -> Untracked | None:
     """Return None when the object exists and carries the tracking id annotation."""
     args = ["get", ref.resource_arg, ref.name, "-o", "json"]
@@ -206,7 +218,7 @@ def check_resource(ref: ResourceRef, kubectl: Kubectl) -> Untracked | None:
     except TakeoverError as e:
         return Untracked(ref, str(e))
     annotations = obj.get("metadata", {}).get("annotations") or {}
-    if TRACKING_ID_ANNOTATION in annotations:
+    if TRACKING_ID_ANNOTATION in annotations or tracking_exempt(ref):
         return None
     return Untracked(ref, f"missing {TRACKING_ID_ANNOTATION} annotation")
 

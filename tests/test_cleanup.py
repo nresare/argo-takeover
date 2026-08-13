@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from argo_takeover.cleanup import (
     Status,
+    cleanup_manifest,
     cleanup_release,
     co_owned,
     delete_release_secrets,
@@ -251,6 +252,23 @@ def test_untracked_object_is_not_touched():
     assert cluster.applies == []
 
 
+def test_cleanup_manifest_uses_rendered_yaml_instead_of_the_secret():
+    cluster = FakeCluster(deployment([helm_entry(HELM_FIELDS), argo_entry()]))
+    manifest = """
+---
+# Source: demo/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+"""
+    (result,) = cleanup_manifest("apps", manifest, cluster, apply=True)
+    assert result.status is Status.CLEANED
+    assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
+    secret_reads = [c for c in cluster.deletes if c[1] == "secret"]
+    assert secret_reads == []
+
+
 def test_delete_release_secrets():
     cluster = FakeCluster(deployment([argo_entry()]))
     deleted = delete_release_secrets("apps", "demo", cluster)
@@ -269,6 +287,21 @@ def test_delete_release_secrets():
         "-o",
         "name",
     ]
+
+
+def test_untracked_crd_is_cleaned_anyway():
+    crd = deployment([helm_entry(HELM_FIELDS), argo_entry()], tracked=False)
+    crd["apiVersion"] = "apiextensions.k8s.io/v1"
+    crd["kind"] = "CustomResourceDefinition"
+    cluster = FakeCluster(crd)
+    manifest = (
+        "apiVersion: apiextensions.k8s.io/v1\n"
+        "kind: CustomResourceDefinition\n"
+        "metadata:\n  name: certificates.cert-manager.io\n"
+    )
+    (result,) = cleanup_manifest("kube-system", manifest, cluster, apply=True)
+    assert result.status is Status.CLEANED
+    assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
 
 
 def test_object_without_helm_manager_is_clean():

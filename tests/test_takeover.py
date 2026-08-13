@@ -181,6 +181,26 @@ def test_check_release_reports_missing_annotation_and_missing_object():
     assert "not found" in reasons["Deployment"]
 
 
+def test_crds_count_as_tracked_without_the_annotation():
+    manifest = (
+        "apiVersion: apiextensions.k8s.io/v1\n"
+        "kind: CustomResourceDefinition\n"
+        "metadata:\n  name: certificates.cert-manager.io\n"
+    )
+    kubectl = FakeKubectl(
+        [release_secret("v1", "1", "deployed", manifest)],
+        {
+            (
+                "CustomResourceDefinition.v1.apiextensions.k8s.io",
+                "certificates.cert-manager.io",
+            ): tracked({"other": "annotation"}),
+        },
+    )
+    refs, untracked = check_release("apps", "demo", kubectl)
+    assert len(refs) == 1
+    assert untracked == []
+
+
 def test_check_release_handles_object_without_annotations():
     kubectl = FakeKubectl(
         [release_secret("v1", "1", "deployed", "")],
