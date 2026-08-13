@@ -289,6 +289,21 @@ def test_delete_release_secrets():
     ]
 
 
+def test_untracked_crd_is_cleaned_anyway():
+    crd = deployment([helm_entry(HELM_FIELDS), argo_entry()], tracked=False)
+    crd["apiVersion"] = "apiextensions.k8s.io/v1"
+    crd["kind"] = "CustomResourceDefinition"
+    cluster = FakeCluster(crd)
+    manifest = (
+        "apiVersion: apiextensions.k8s.io/v1\n"
+        "kind: CustomResourceDefinition\n"
+        "metadata:\n  name: certificates.cert-manager.io\n"
+    )
+    (result,) = cleanup_manifest("kube-system", manifest, cluster, apply=True)
+    assert result.status is Status.CLEANED
+    assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
+
+
 def test_object_without_helm_manager_is_clean():
     cluster = FakeCluster(deployment([argo_entry()]))
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)

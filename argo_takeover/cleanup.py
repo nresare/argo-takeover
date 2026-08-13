@@ -33,6 +33,7 @@ from argo_takeover.takeover import (
     load_release,
     parse_manifest,
     run_kubectl,
+    tracking_exempt,
 )
 
 HELM_MANAGER = "helm"
@@ -204,7 +205,7 @@ def cleanup_resource(
         return CleanupResult(ref, Status.FAILED, problems=(str(e),))
 
     annotations = obj.get("metadata", {}).get("annotations") or {}
-    if TRACKING_ID_ANNOTATION not in annotations:
+    if TRACKING_ID_ANNOTATION not in annotations and not tracking_exempt(ref):
         return CleanupResult(
             ref,
             Status.NEEDS_REVIEW,
