@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import gzip
 import json
 from collections.abc import Sequence
@@ -11,80 +12,46 @@ from argo_takeover.cleanup import (
     Status,
     cleanup_manifest,
     cleanup_release,
-    co_owned,
     delete_release_secrets,
-    expected_junk,
-    live_value,
-    owned_paths,
-    render_path,
-    value_changes,
+    helm_matches,
+    json_pointer_escape,
 )
 from argo_takeover.takeover import TakeoverError
 
-HELM_FIELDS = {
-    "f:metadata": {
-        "f:labels": {".": {}, "f:app.kubernetes.io/managed-by": {}},
-        "f:annotations": {
-            "f:meta.helm.sh/release-name": {},
-            "f:meta.helm.sh/release-namespace": {},
-        },
-    },
-    "f:spec": {"f:replicas": {}},
-}
 
-ARGO_FIELDS = {
-    "f:metadata": {
-        "f:annotations": {"f:argocd.argoproj.io/tracking-id": {}},
-        "f:labels": {"f:app.kubernetes.io/name": {}},
-    },
-    "f:spec": {"f:replicas": {}},
-}
-
-
-def helm_entry(fields: dict, operation: str = "Update") -> dict:
-    return {"manager": "helm", "operation": operation, "fieldsV1": fields}
-
-
-def argo_entry() -> dict:
-    return {
-        "manager": "argocd-controller",
-        "operation": "Update",
-        "fieldsV1": ARGO_FIELDS,
+def deployment(*, labels: dict | None = None, annotations: dict | None = None) -> dict:
+    default_labels = {
+        "app.kubernetes.io/managed-by": "Helm",
+        "helm.sh/chart": "web-1.2.3",
+        "app.kubernetes.io/name": "web",
     }
-
-
-def deployment(managed_fields: list[dict], tracked: bool = True) -> dict:
-    annotations = {
+    default_annotations = {
         "meta.helm.sh/release-name": "demo",
         "meta.helm.sh/release-namespace": "apps",
+        "argocd.argoproj.io/tracking-id": "demo:apps/Deployment:apps/web",
     }
-    if tracked:
-        annotations["argocd.argoproj.io/tracking-id"] = "demo:apps/Deployment:apps/web"
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
             "name": "web",
             "namespace": "apps",
-            "labels": {
-                "app.kubernetes.io/managed-by": "Helm",
-                "app.kubernetes.io/name": "web",
-            },
-            "annotations": annotations,
-            "managedFields": managed_fields,
+            "labels": labels if labels is not None else default_labels,
+            "annotations": annotations
+            if annotations is not None
+            else default_annotations,
         },
         "spec": {"replicas": 2},
     }
 
 
 class FakeCluster:
-    """A one-object cluster that mimics the apiserver's apply semantics."""
+    """A one-object cluster whose `patch --type=json` mimics the apiserver."""
 
-    def __init__(self, obj: dict, combines_managers: bool = True):
+    def __init__(self, obj: dict):
         self.obj = obj
-        self.combines_managers = combines_managers
-        self.applies: list[dict] = []
-        self.patches = 0
+        self.patches: list[list[dict]] = []
+        self.gets = 0
         self.deletes: list[list[str]] = []
 
     def __call__(self, args: Sequence[str], input_data: str | None = None) -> str:
@@ -100,21 +67,12 @@ class FakeCluster:
             }
             return json.dumps({"items": [secret]})
         if args[0] == "get":
+            self.gets += 1
             return json.dumps(self.obj)
-        if args[0] == "apply":
-            assert input_data is not None
-            self.applies.append(json.loads(input_data))
-            entries = self.obj["metadata"]["managedFields"]
-            can_relinquish = self.combines_managers or any(
-                e["manager"] == "helm" and e["operation"] == "Apply" for e in entries
-            )
-            if can_relinquish:
-                self._strip_helm()
-            return ""
         if args[0] == "patch":
-            patch = json.loads(args[args.index("-p") + 1])
-            self.obj["metadata"]["managedFields"] = patch[0]["value"]
-            self.patches += 1
+            ops = json.loads(args[args.index("-p") + 1])
+            self.patches.append(ops)
+            self._apply_json_patch(ops)
             return ""
         if args[0] == "delete":
             self.deletes.append(list(args))
@@ -123,137 +81,178 @@ class FakeCluster:
             )
         raise TakeoverError(f"unexpected kubectl call: {args}")
 
-    def _strip_helm(self) -> None:
-        metadata = self.obj["metadata"]
-        metadata["managedFields"] = [
-            e for e in metadata["managedFields"] if e["manager"] != "helm"
-        ]
-        metadata["labels"].pop("app.kubernetes.io/managed-by", None)
-        for key in list(metadata["annotations"]):
-            if key.startswith("meta.helm.sh/"):
-                del metadata["annotations"][key]
+    def _apply_json_patch(self, ops: list[dict]) -> None:
+        for op in ops:
+            assert op["op"] == "remove"
+            parts = op["path"].split("/")[1:]
+            key = parts[-1].replace("~1", "/").replace("~0", "~")
+            container = self.obj
+            for part in parts[:-1]:
+                container = container[part]
+            del container[key]
 
 
-def test_owned_paths_flattens_the_trie():
-    assert owned_paths(HELM_FIELDS) == {
-        ("f:metadata", "f:labels", "."),
-        ("f:metadata", "f:labels", "f:app.kubernetes.io/managed-by"),
-        ("f:metadata", "f:annotations", "f:meta.helm.sh/release-name"),
-        ("f:metadata", "f:annotations", "f:meta.helm.sh/release-namespace"),
-        ("f:spec", "f:replicas"),
+def test_helm_matches_finds_key_or_value_hits_case_insensitively():
+    mapping = {
+        "app.kubernetes.io/managed-by": "Helm",
+        "helm.sh/chart": "web-1.2.3",
+        "app.kubernetes.io/name": "web",
+        "some.other/HELM-ish": "unrelated",
     }
-
-
-def test_co_owned_matches_exact_path_and_owned_prefix():
-    others = {("f:spec", "f:replicas"), ("f:data",)}
-    assert co_owned(("f:spec", "f:replicas"), others)
-    assert co_owned(("f:data", "f:key"), others)
-    assert not co_owned(("f:metadata", "f:labels", "f:x"), others)
-
-
-def test_expected_junk():
-    assert expected_junk(("f:metadata", "f:labels", "f:app.kubernetes.io/managed-by"))
-    assert expected_junk(("f:metadata", "f:labels", "f:helm.sh/chart"))
-    assert expected_junk(("f:metadata", "f:annotations", "f:meta.helm.sh/release-name"))
-    assert expected_junk(("f:metadata", "f:labels", "."))
-    assert not expected_junk(("f:spec", "f:replicas"))
-    assert not expected_junk(("f:metadata", "f:labels", "f:custom"))
-
-
-def test_render_path():
-    assert render_path(("f:metadata", "f:labels", "f:a/b")) == "metadata.labels.a/b"
-
-
-def test_live_value_resolves_keyed_list_items():
-    obj = {
-        "spec": {
-            "ports": [
-                {"port": 80, "protocol": "TCP", "name": "http"},
-                {"port": 443, "protocol": "TCP", "name": "https"},
-            ]
-        }
-    }
-    path = ("f:spec", "f:ports", 'k:{"port":443,"protocol":"TCP"}', "f:name")
-    assert live_value(obj, path) == "https"
-    missing = ("f:spec", "f:ports", 'k:{"port":8080,"protocol":"TCP"}', "f:name")
-    assert live_value(obj, missing) is None
-    assert live_value(obj, ("f:spec", "f:absent")) is None
-
-
-def test_value_changes_ignores_deleted_and_identical_fields():
-    before = {"metadata": {"labels": {"a": "1"}}, "spec": {"x": "same", "y": "old"}}
-    after = {"metadata": {"labels": {}}, "spec": {"x": "same", "y": "new"}}
-    paths = [
-        ("f:metadata", "f:labels", "f:a"),  # deleted: fine
-        ("f:spec", "f:x"),  # re-defaulted to the same value: fine
-        ("f:spec", "f:y"),  # changed: reported
+    assert helm_matches(mapping) == [
+        "app.kubernetes.io/managed-by",
+        "helm.sh/chart",
+        "some.other/HELM-ish",
     ]
-    assert value_changes(before, after, paths) == (
-        'value changed: spec.y was "old", is now "new"',
+
+
+def test_helm_matches_handles_empty_and_none():
+    assert helm_matches(None) == []
+    assert helm_matches({}) == []
+    assert helm_matches({"app.kubernetes.io/name": "web"}) == []
+
+
+def test_json_pointer_escape():
+    assert (
+        json_pointer_escape("meta.helm.sh/release-name") == "meta.helm.sh~1release-name"
     )
+    assert json_pointer_escape("a~b") == "a~0b"
 
 
 def test_dry_run_reports_without_mutating():
-    cluster = FakeCluster(deployment([helm_entry(HELM_FIELDS), argo_entry()]))
+    cluster = FakeCluster(deployment())
     (result,) = cleanup_release("apps", "demo", cluster)
     assert result.status is Status.WOULD_CLEAN
     assert result.removals == (
-        "metadata.annotations.meta.helm.sh/release-name",
-        "metadata.annotations.meta.helm.sh/release-namespace",
-        "metadata.labels.app.kubernetes.io/managed-by",
+        "labels.app.kubernetes.io/managed-by",
+        "labels.helm.sh/chart",
+        "annotations.meta.helm.sh/release-name",
+        "annotations.meta.helm.sh/release-namespace",
     )
-    assert cluster.applies == []
+    assert cluster.patches == []
 
 
-def test_apply_cleans_and_verifies():
-    cluster = FakeCluster(deployment([helm_entry(HELM_FIELDS), argo_entry()]))
+def test_apply_removes_only_helm_matching_labels_and_annotations():
+    cluster = FakeCluster(deployment())
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)
     assert result.status is Status.CLEANED
-    assert len(cluster.applies) == 1
-    assert cluster.applies[0] == {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "web", "namespace": "apps"},
+    assert len(cluster.patches) == 1
+    metadata = cluster.obj["metadata"]
+    assert metadata["labels"] == {"app.kubernetes.io/name": "web"}
+    assert metadata["annotations"] == {
+        "argocd.argoproj.io/tracking-id": "demo:apps/Deployment:apps/web"
     }
+    # untouched
+    assert cluster.obj["spec"] == {"replicas": 2}
+
+
+def test_incident_regression_configmap_data_and_service_selector_survive_cleanup():
+    configmap = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "app-config",
+            "namespace": "apps",
+            "labels": {
+                "app.kubernetes.io/managed-by": "Helm",
+                "helm.sh/chart": "app-1.0.0",
+            },
+            "annotations": {
+                "meta.helm.sh/release-name": "demo",
+                "meta.helm.sh/release-namespace": "apps",
+                "argocd.argoproj.io/tracking-id": "demo:/ConfigMap:apps/app-config",
+            },
+        },
+        "data": {"app.conf": "real running config\nkey=value\n"},
+    }
+    before_data = copy.deepcopy(configmap["data"])
+    cluster = FakeCluster(configmap)
+    (result,) = cleanup_release("apps", "demo", cluster, apply=True)
+    assert result.status is Status.CLEANED
+    assert cluster.obj["data"] == before_data
     assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
-    assert cluster.obj["metadata"]["labels"] == {"app.kubernetes.io/name": "web"}
+    assert "helm.sh/chart" not in cluster.obj["metadata"]["labels"]
+
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "app-headless",
+            "namespace": "apps",
+            "labels": {
+                "app.kubernetes.io/managed-by": "Helm",
+                "helm.sh/chart": "app-1.0.0",
+            },
+            "annotations": {
+                "meta.helm.sh/release-name": "demo",
+                "meta.helm.sh/release-namespace": "apps",
+                "argocd.argoproj.io/tracking-id": "demo:/Service:apps/app-headless",
+            },
+        },
+        "spec": {
+            "clusterIP": "None",
+            "selector": {"app": "app", "role": "member"},
+            "ports": [{"port": 7000, "name": "gossip"}],
+        },
+    }
+    before_spec = copy.deepcopy(service["spec"])
+    cluster2 = FakeCluster(service)
+    (result2,) = cleanup_release("apps", "demo", cluster2, apply=True)
+    assert result2.status is Status.CLEANED
+    assert cluster2.obj["spec"] == before_spec
+    assert "app.kubernetes.io/managed-by" not in cluster2.obj["metadata"]["labels"]
+    assert "helm.sh/chart" not in cluster2.obj["metadata"]["labels"]
 
 
-def test_apply_falls_back_to_upgrading_the_manager_entry():
-    cluster = FakeCluster(
-        deployment([helm_entry(HELM_FIELDS), argo_entry()]), combines_managers=False
-    )
+def test_immutable_field_resources_now_clean_successfully():
+    crb = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {
+            "name": "app-binding",
+            "labels": {
+                "app.kubernetes.io/managed-by": "Helm",
+                "helm.sh/chart": "app-1.0.0",
+            },
+            "annotations": {
+                "meta.helm.sh/release-name": "demo",
+                "meta.helm.sh/release-namespace": "apps",
+                "argocd.argoproj.io/tracking-id": (
+                    "demo:rbac.authorization.k8s.io/ClusterRoleBinding:app-binding"
+                ),
+            },
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "app-role",
+        },
+        "subjects": [{"kind": "ServiceAccount", "name": "app", "namespace": "apps"}],
+    }
+    before_role_ref = copy.deepcopy(crb["roleRef"])
+    cluster = FakeCluster(crb)
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)
     assert result.status is Status.CLEANED
-    assert cluster.patches == 1
-    assert len(cluster.applies) == 2
-
-
-def test_unexpected_sole_ownership_is_labeled_and_cleaned():
-    fields = {**HELM_FIELDS, "f:spec": {"f:replicas": {}, "f:paused": {}}}
-    cluster = FakeCluster(deployment([helm_entry(fields), argo_entry()]))
-    (result,) = cleanup_release("apps", "demo", cluster, apply=True)
-    assert result.status is Status.CLEANED
-    labeled = [r for r in result.removals if "spec.paused" in r]
-    assert labeled == [
-        "spec.paused = null (probably a Kubernetes default, attributed to helm)"
-    ]
-    assert not any(
-        "Kubernetes default" in r for r in result.removals if "meta.helm" in r
-    )
+    assert cluster.obj["roleRef"] == before_role_ref
+    assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
 
 
 def test_untracked_object_is_not_touched():
     cluster = FakeCluster(
-        deployment([helm_entry(HELM_FIELDS), argo_entry()], tracked=False)
+        deployment(
+            annotations={
+                "meta.helm.sh/release-name": "demo",
+                "meta.helm.sh/release-namespace": "apps",
+            }
+        )
     )
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)
     assert result.status is Status.NEEDS_REVIEW
-    assert cluster.applies == []
+    assert cluster.patches == []
 
 
 def test_cleanup_manifest_uses_rendered_yaml_instead_of_the_secret():
-    cluster = FakeCluster(deployment([helm_entry(HELM_FIELDS), argo_entry()]))
+    cluster = FakeCluster(deployment())
     manifest = """
 ---
 # Source: demo/templates/deployment.yaml
@@ -270,7 +269,7 @@ metadata:
 
 
 def test_delete_release_secrets():
-    cluster = FakeCluster(deployment([argo_entry()]))
+    cluster = FakeCluster(deployment())
     deleted = delete_release_secrets("apps", "demo", cluster)
     assert deleted == [
         "secret/sh.helm.release.v1.demo.v1",
@@ -290,7 +289,12 @@ def test_delete_release_secrets():
 
 
 def test_untracked_crd_is_cleaned_anyway():
-    crd = deployment([helm_entry(HELM_FIELDS), argo_entry()], tracked=False)
+    crd = deployment(
+        annotations={
+            "meta.helm.sh/release-name": "demo",
+            "meta.helm.sh/release-namespace": "apps",
+        }
+    )
     crd["apiVersion"] = "apiextensions.k8s.io/v1"
     crd["kind"] = "CustomResourceDefinition"
     cluster = FakeCluster(crd)
@@ -304,8 +308,15 @@ def test_untracked_crd_is_cleaned_anyway():
     assert "app.kubernetes.io/managed-by" not in cluster.obj["metadata"]["labels"]
 
 
-def test_object_without_helm_manager_is_clean():
-    cluster = FakeCluster(deployment([argo_entry()]))
+def test_object_without_helm_labels_or_annotations_is_clean():
+    cluster = FakeCluster(
+        deployment(
+            labels={"app.kubernetes.io/name": "web"},
+            annotations={
+                "argocd.argoproj.io/tracking-id": "demo:apps/Deployment:apps/web"
+            },
+        )
+    )
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)
     assert result.status is Status.CLEAN
-    assert cluster.applies == []
+    assert cluster.patches == []
