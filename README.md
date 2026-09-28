@@ -13,16 +13,14 @@ contains the rendered manifest as base64(gzip(json)).
 **check** fetches every object from that manifest and verifies it carries the
 `argocd.argoproj.io/tracking-id` annotation, i.e. that Argo CD tracks it.
 
-**cleanup** removes Helm's leftovers from each tracked object: the
-`app.kubernetes.io/managed-by` and `helm.sh/chart` labels, the `meta.helm.sh/*`
-annotations, and helm's entry in `managedFields`. The mechanism is a
-server-side apply of an empty manifest as the field manager `helm` — the
-apiserver then deletes fields solely owned by helm and transfers co-owned
-fields to their other managers (such as `argocd-controller`), so values Argo CD
-manages are never disturbed. Fields the apiserver defaulted in at creation time
-are re-defaulted on the same request; an after-check reports any value that
-actually changed. Once every object is clean, the Helm release secrets are
-deleted so a stray `helm upgrade` can no longer touch the objects.
+**cleanup** removes Helm's leftovers from each tracked object: every label and
+annotation whose key or value contains "helm" (case-insensitively) — which
+covers at least the `app.kubernetes.io/managed-by` and `helm.sh/chart` labels
+and the `meta.helm.sh/*` annotations. The mechanism is a targeted JSON patch
+naming exactly those keys, so nothing else on the object — its `data`, `spec`,
+or any other label or annotation — is ever touched. Once every object is
+clean, the Helm release secrets are deleted so a stray `helm upgrade` can no
+longer touch the objects.
 
 ## Usage
 
