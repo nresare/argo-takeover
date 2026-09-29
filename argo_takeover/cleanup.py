@@ -30,6 +30,7 @@ from typing import Any
 from argo_takeover.takeover import (
     TRACKING_ID_ANNOTATION,
     Kubectl,
+    NotFoundError,
     ResourceRef,
     TakeoverError,
     load_release,
@@ -44,6 +45,7 @@ class Status(StrEnum):
     WOULD_CLEAN = "would clean"
     CLEANED = "cleaned"
     NEEDS_REVIEW = "needs review"
+    MISSING = "missing"
     FAILED = "failed"
 
 
@@ -107,6 +109,8 @@ def cleanup_resource(
 ) -> CleanupResult:
     try:
         obj = get_object(ref, kubectl)
+    except NotFoundError:
+        return CleanupResult(ref, Status.MISSING)
     except TakeoverError as e:
         return CleanupResult(ref, Status.FAILED, problems=(str(e),))
 

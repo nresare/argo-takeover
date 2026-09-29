@@ -16,7 +16,7 @@ from argo_takeover.cleanup import (
     helm_matches,
     json_pointer_escape,
 )
-from argo_takeover.takeover import TakeoverError
+from argo_takeover.takeover import NotFoundError, TakeoverError
 
 
 def deployment(*, labels: dict | None = None, annotations: dict | None = None) -> dict:
@@ -320,3 +320,13 @@ def test_object_without_helm_labels_or_annotations_is_clean():
     (result,) = cleanup_release("apps", "demo", cluster, apply=True)
     assert result.status is Status.CLEAN
     assert cluster.patches == []
+
+
+def test_missing_object_is_reported_not_failed():
+    def kubectl(args: Sequence[str], input_data: str | None = None) -> str:
+        if args[1] == "secret":
+            return FakeCluster(deployment())(args)
+        raise NotFoundError("not found")
+
+    (result,) = cleanup_release("apps", "demo", kubectl, apply=True)
+    assert result.status is Status.MISSING

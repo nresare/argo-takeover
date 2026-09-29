@@ -10,6 +10,7 @@ from collections.abc import Sequence
 import pytest
 
 from argo_takeover.takeover import (
+    NotFoundError,
     ResourceRef,
     TakeoverError,
     check_release,
@@ -87,7 +88,7 @@ class FakeKubectl:
         try:
             return json.dumps(self.objects[(kind, name)])
         except KeyError:
-            raise TakeoverError(f'{kind} "{name}" not found') from None
+            raise NotFoundError(f'{kind} "{name}" not found') from None
 
 
 def tracked(annotations: dict[str, str] | None = None) -> dict:
@@ -165,20 +166,20 @@ def test_check_release_all_tracked():
             ),
         },
     )
-    refs, untracked = check_release("apps", "demo", kubectl)
+    refs, untracked, _ = check_release("apps", "demo", kubectl)
     assert len(refs) == 2
     assert untracked == []
 
 
-def test_check_release_reports_missing_annotation_and_missing_object():
+def test_check_release_separates_missing_annotation_from_missing_object():
     kubectl = FakeKubectl(
         [release_secret("v1", "1", "deployed", MANIFEST)],
         {("ConfigMap", "settings"): tracked({"other": "annotation"})},
     )
-    _, untracked = check_release("apps", "demo", kubectl)
+    _, untracked, missing = check_release("apps", "demo", kubectl)
     reasons = {u.ref.kind: u.reason for u in untracked}
-    assert reasons["ConfigMap"] == "missing argocd.argoproj.io/tracking-id annotation"
-    assert "not found" in reasons["Deployment"]
+    assert reasons == {"ConfigMap": "missing argocd.argoproj.io/tracking-id annotation"}
+    assert [r.kind for r in missing] == ["Deployment"]
 
 
 def test_crds_count_as_tracked_without_the_annotation():
@@ -196,7 +197,7 @@ def test_crds_count_as_tracked_without_the_annotation():
             ): tracked({"other": "annotation"}),
         },
     )
-    refs, untracked = check_release("apps", "demo", kubectl)
+    refs, untracked, _ = check_release("apps", "demo", kubectl)
     assert len(refs) == 1
     assert untracked == []
 
@@ -206,7 +207,7 @@ def test_check_release_handles_object_without_annotations():
         [release_secret("v1", "1", "deployed", "")],
         {},
     )
-    refs, untracked = check_release("apps", "demo", kubectl)
+    refs, untracked, _ = check_release("apps", "demo", kubectl)
     assert refs == [] and untracked == []
 
 

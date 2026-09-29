@@ -32,6 +32,10 @@ class TakeoverError(Exception):
     """Raised when the state of the cluster or the release cannot be determined."""
 
 
+class NotFoundError(TakeoverError):
+    """Raised when kubectl reports that the requested object does not exist."""
+
+
 class Kubectl(Protocol):
     """Runs a kubectl invocation and returns its stdout."""
 
@@ -85,7 +89,10 @@ def run_kubectl(args: Sequence[str], input_data: str | None = None) -> str:
         input=input_data,
     )
     if result.returncode != 0:
-        raise TakeoverError(
+        error = TakeoverError
+        if "(NotFound)" in result.stderr:
+            error = NotFoundError
+        raise error(
             f"kubectl {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout
@@ -209,12 +216,18 @@ def tracking_exempt(ref: ResourceRef) -> bool:
 
 
 def check_resource(ref: ResourceRef, kubectl: Kubectl) -> Untracked | None:
-    """Return None when the object exists and carries the tracking id annotation."""
+    """Return None when the object carries the tracking id annotation.
+
+    Raises NotFoundError when the object does not exist, so that callers can
+    tell an absent object from one that Argo CD has not taken over.
+    """
     args = ["get", ref.resource_arg, ref.name, "-o", "json"]
     if ref.namespace:
         args += ["-n", ref.namespace]
     try:
         obj = json.loads(kubectl(args))
+    except NotFoundError:
+        raise
     except TakeoverError as e:
         return Untracked(ref, str(e))
     annotations = obj.get("metadata", {}).get("annotations") or {}
@@ -223,12 +236,27 @@ def check_resource(ref: ResourceRef, kubectl: Kubectl) -> Untracked | None:
     return Untracked(ref, f"missing {TRACKING_ID_ANNOTATION} annotation")
 
 
+def _check_or_missing(
+    ref: ResourceRef, kubectl: Kubectl
+) -> Untracked | None | ResourceRef:
+    try:
+        return check_resource(ref, kubectl)
+    except NotFoundError:
+        return ref
+
+
 def check_release(
     namespace: str, release: str, kubectl: Kubectl = run_kubectl
-) -> tuple[list[ResourceRef], list[Untracked]]:
-    """Check every object owned by ``release``, returning all of them and the failures."""
+) -> tuple[list[ResourceRef], list[Untracked], list[ResourceRef]]:
+    """Check every object owned by ``release``.
+
+    Returns all objects, the ones not tracked by Argo CD, and the ones that do
+    not exist in the cluster at all (nothing to take over, so not a failure).
+    """
     release_data = load_release(namespace, release, kubectl)
     refs = parse_manifest(release_data.get("manifest") or "", namespace)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = pool.map(lambda ref: check_resource(ref, kubectl), refs)
-    return refs, [r for r in results if r is not None]
+        results = list(pool.map(lambda ref: _check_or_missing(ref, kubectl), refs))
+    missing = [r for r in results if isinstance(r, ResourceRef)]
+    untracked = [r for r in results if isinstance(r, Untracked)]
+    return refs, untracked, missing
