@@ -19,16 +19,21 @@ from argo_takeover.takeover import TakeoverError, check_release
 
 
 def run_check(namespace: str, release: str) -> int:
-    refs, untracked = check_release(namespace, release)
+    refs, untracked, missing = check_release(namespace, release)
     if not refs:
         print(f"release {release} owns no objects", file=sys.stderr)
         return 2
+    if missing:
+        print(f"{len(missing)} of {len(refs)} objects do not exist in the cluster:")
+        for ref in missing:
+            print(f"  {ref}")
     if untracked:
         print(f"{len(untracked)} of {len(refs)} objects not taken over by Argo CD:")
         for item in untracked:
             print(f"  {item}")
         return 1
-    print(f"takeover successful: all {len(refs)} objects are tracked by Argo CD")
+    present = len(refs) - len(missing)
+    print(f"takeover successful: all {present} existing objects are tracked by Argo CD")
     return 0
 
 
@@ -55,7 +60,7 @@ def run_cleanup(
     print(", ".join(f"{count} {status}" for status, count in counts.items()))
     if not apply and Status.WOULD_CLEAN in counts:
         print("dry run: re-run with --apply to modify the cluster")
-    ok = {Status.CLEAN, Status.CLEANED if apply else Status.WOULD_CLEAN}
+    ok = {Status.CLEAN, Status.MISSING, Status.CLEANED if apply else Status.WOULD_CLEAN}
     all_ok = set(counts) <= ok
     if apply and all_ok and release is not None:
         for name in delete_release_secrets(namespace, release):
